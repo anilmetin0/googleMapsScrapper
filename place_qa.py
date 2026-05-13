@@ -3,6 +3,8 @@ import re
 import logging
 import sys
 import threading
+import hashlib
+import math
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -33,6 +35,7 @@ CHROMA_PATH     = os.getenv("CHROMA_PATH", "./chroma_db")
 CHROMA_HOST     = os.getenv("CHROMA_HOST", "")
 CHROMA_PORT     = int(os.getenv("CHROMA_PORT", "8000"))
 COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "place_reviews_v2")
+HASH_EMBED_DIM  = int(os.getenv("HASH_EMBED_DIM", "384"))
 DEFAULT_TOP_K   = 6
 
 SYSTEM_PROMPT = (
@@ -60,14 +63,51 @@ collection                                 = None
 _embed_model_lock                         = threading.Lock()
 
 
-def get_embed_model() -> SentenceTransformer:
+def get_embed_model() -> Optional[SentenceTransformer]:
     global embed_model
+    if use_hash_embeddings():
+        return None
+
     if embed_model is None:
         with _embed_model_lock:
             if embed_model is None:
                 log.info(f"Embedding modeli lazy yükleniyor: {EMBED_MODEL} ({DEVICE})")
                 embed_model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
     return embed_model
+
+
+def use_hash_embeddings() -> bool:
+    return EMBED_MODEL.lower() in {"hash", "hashing", "local-hashing"}
+
+
+def hash_embedding(text: str) -> list[float]:
+    vector = [0.0] * HASH_EMBED_DIM
+    tokens = re.findall(r"\w+", text.lower(), flags=re.UNICODE)
+    if not tokens:
+        tokens = [text.lower()]
+
+    for token in tokens:
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+        index = int.from_bytes(digest[:4], "little") % HASH_EMBED_DIM
+        sign = 1.0 if digest[4] & 1 else -1.0
+        vector[index] += sign
+
+    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+    return [value / norm for value in vector]
+
+
+def encode_query(question: str) -> list[float]:
+    if use_hash_embeddings():
+        return hash_embedding(f"query: {question}")
+
+    model = get_embed_model()
+    if model is None:
+        raise RuntimeError("SentenceTransformer model is not loaded")
+
+    return model.encode(
+        f"query: {question}",
+        normalize_embeddings=True,
+    ).tolist()
 
 
 @asynccontextmanager
@@ -139,7 +179,8 @@ def health():
         "device":                DEVICE,
         "collection":            COLLECTION_NAME,
         "model":                 EMBED_MODEL,
-        "model_loaded":           embed_model is not None,
+        "model_loaded":           use_hash_embeddings() or embed_model is not None,
+        "hash_embed_dim":         HASH_EMBED_DIM if use_hash_embeddings() else None,
         "total_indexed_reviews": collection.count() if collection else 0,
     }
 
@@ -154,10 +195,7 @@ def ask(req: AskRequest):
         )
 
     # Soruyu embed et
-    question_embedding = get_embed_model().encode(
-        f"query: {req.question}",
-        normalize_embeddings=True,
-    ).tolist()
+    question_embedding = encode_query(req.question)
 
     # O mekana ait tüm yorumları al
     place_docs = collection.get(

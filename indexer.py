@@ -4,6 +4,7 @@ import sys
 import logging
 import argparse
 import hashlib
+import math
 import re
 import threading
 from contextlib import asynccontextmanager
@@ -33,6 +34,7 @@ CHROMA_PATH     = os.getenv("CHROMA_PATH", "./chroma_db")
 CHROMA_HOST     = os.getenv("CHROMA_HOST", "")
 CHROMA_PORT     = int(os.getenv("CHROMA_PORT", "8000"))
 COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "place_reviews_v2")
+HASH_EMBED_DIM  = int(os.getenv("HASH_EMBED_DIM", "384"))
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
 INDEXER_INPUT   = os.getenv("INDEXER_INPUT", "scraped_data.json")
 QUEUE_NAME      = "queue:places:indexer"
@@ -69,13 +71,48 @@ def review_doc_id(place_name: str, idx: int) -> str:
     return f"{place_slug(place_name)}_{idx}"
 
 
+def use_hash_embeddings() -> bool:
+    return EMBED_MODEL.lower() in {"hash", "hashing", "local-hashing"}
+
+
+def hash_embedding(text: str) -> list[float]:
+    vector = [0.0] * HASH_EMBED_DIM
+    tokens = re.findall(r"\w+", text.lower(), flags=re.UNICODE)
+    if not tokens:
+        tokens = [text.lower()]
+
+    for token in tokens:
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+        index = int.from_bytes(digest[:4], "little") % HASH_EMBED_DIM
+        sign = 1.0 if digest[4] & 1 else -1.0
+        vector[index] += sign
+
+    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+    return [value / norm for value in vector]
+
+
+def encode_texts(model: Optional[SentenceTransformer], texts: list[str]) -> list[list[float]]:
+    if use_hash_embeddings():
+        return [hash_embedding(text) for text in texts]
+
+    if model is None:
+        raise RuntimeError("SentenceTransformer model is not loaded")
+
+    return model.encode(
+        texts,
+        batch_size=BATCH_SIZE,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    ).tolist()
+
+
 # ---------------------------------------------------------------------------
 # Core
 # ---------------------------------------------------------------------------
 
 def index_place(
     collection,
-    model:      SentenceTransformer,
+    model:      Optional[SentenceTransformer],
     place_name: str,
     source_url: str,
     reviews:    list,
@@ -92,12 +129,7 @@ def index_place(
         log.info(f"Güncelleniyor — {len(all_existing['ids'])} eski yorum silindi.")
 
     prefixed   = [f"passage: {r}" for r in reviews]
-    embeddings = model.encode(
-        prefixed,
-        batch_size=BATCH_SIZE,
-        show_progress_bar=False,
-        normalize_embeddings=True,
-    ).tolist()
+    embeddings = encode_texts(model, prefixed)
 
     collection.add(
         ids=[review_doc_id(place_name, i) for i in range(len(reviews))],
@@ -177,8 +209,11 @@ _model: Optional[SentenceTransformer] = None
 _model_lock = threading.Lock()
 
 
-def get_model() -> SentenceTransformer:
+def get_model() -> Optional[SentenceTransformer]:
     global _model
+    if use_hash_embeddings():
+        return None
+
     if _model is None:
         with _model_lock:
             if _model is None:
@@ -266,7 +301,8 @@ def health():
         "status": "ok",
         "collection": COLLECTION_NAME,
         "model": EMBED_MODEL,
-        "model_loaded": _model is not None,
+        "model_loaded": use_hash_embeddings() or _model is not None,
+        "hash_embed_dim": HASH_EMBED_DIM if use_hash_embeddings() else None,
         "total_indexed_reviews": count,
         "worker": _worker_stats,
     }
