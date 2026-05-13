@@ -8,6 +8,7 @@ import re
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 from urllib.parse import unquote
 
 import redis
@@ -172,11 +173,22 @@ def run(input_path: str, reset: bool = False):
 _job:          dict = {"status": "idle", "detail": ""}
 _lock               = threading.Lock()
 _worker_stats: dict = {"processed": 0, "failed": 0, "running": False}
+_model: Optional[SentenceTransformer] = None
+_model_lock = threading.Lock()
+
+
+def get_model() -> SentenceTransformer:
+    global _model
+    if _model is None:
+        with _model_lock:
+            if _model is None:
+                log.info(f"Model lazy yükleniyor: {EMBED_MODEL} ({DEVICE})")
+                _model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
+    return _model
 
 
 def _worker_loop():
     log.info(f"[worker] Indexer Redis worker başladı — kuyruk: {QUEUE_NAME}")
-    model         = SentenceTransformer(EMBED_MODEL, device=DEVICE)
     r             = redis.from_url(REDIS_URL, decode_responses=True)
     chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT) if CHROMA_HOST else chromadb.PersistentClient(path=CHROMA_PATH)
     collection    = chroma_client.get_or_create_collection(
@@ -207,7 +219,7 @@ def _worker_loop():
             continue
 
         try:
-            added = index_place(collection, model, place_name, source_url, reviews, upsert=True)
+            added = index_place(collection, get_model(), place_name, source_url, reviews, upsert=True)
             if added:
                 _worker_stats["processed"] += 1
                 log.info(f"[worker] ✓ '{place_name}' — {added} yorum eklendi/güncellendi.")
@@ -254,6 +266,7 @@ def health():
         "status": "ok",
         "collection": COLLECTION_NAME,
         "model": EMBED_MODEL,
+        "model_loaded": _model is not None,
         "total_indexed_reviews": count,
         "worker": _worker_stats,
     }

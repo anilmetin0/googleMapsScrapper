@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import sys
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -56,13 +57,22 @@ else:
 embed_model: Optional[SentenceTransformer] = None
 llm_client:  Optional[Anthropic]           = None
 collection                                 = None
+_embed_model_lock                         = threading.Lock()
+
+
+def get_embed_model() -> SentenceTransformer:
+    global embed_model
+    if embed_model is None:
+        with _embed_model_lock:
+            if embed_model is None:
+                log.info(f"Embedding modeli lazy yükleniyor: {EMBED_MODEL} ({DEVICE})")
+                embed_model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
+    return embed_model
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global embed_model, llm_client, collection
-    log.info(f"Embedding modeli yükleniyor: {EMBED_MODEL} ({DEVICE})")
-    embed_model  = SentenceTransformer(EMBED_MODEL, device=DEVICE)
+    global llm_client, collection
     llm_client   = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT) if CHROMA_HOST else chromadb.PersistentClient(path=CHROMA_PATH)
     collection   = chroma_client.get_or_create_collection(
@@ -117,6 +127,8 @@ def health():
         "status":                "ok",
         "device":                DEVICE,
         "collection":            COLLECTION_NAME,
+        "model":                 EMBED_MODEL,
+        "model_loaded":           embed_model is not None,
         "total_indexed_reviews": collection.count() if collection else 0,
     }
 
@@ -131,7 +143,7 @@ def ask(req: AskRequest):
         )
 
     # Soruyu embed et
-    question_embedding = embed_model.encode(
+    question_embedding = get_embed_model().encode(
         f"query: {req.question}",
         normalize_embeddings=True,
     ).tolist()
