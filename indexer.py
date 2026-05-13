@@ -217,7 +217,7 @@ def run(input_path: str, reset: bool = False):
 
 _job:          dict = {"status": "idle", "detail": ""}
 _lock               = threading.Lock()
-_worker_stats: dict = {"processed": 0, "failed": 0, "running": False}
+_worker_stats: dict = {"processed": 0, "failed": 0, "skipped": 0, "running": False}
 _models: dict[str, SentenceTransformer] = {}
 _model_lock = threading.Lock()
 
@@ -300,7 +300,7 @@ def _worker_loop():
         log.info(f"[worker] İndeksleniyor: '{place_name}' — {len(reviews)} yorum")
 
         if not reviews:
-            _worker_stats["failed"] += 1
+            _worker_stats["skipped"] += 1
             continue
 
         try:

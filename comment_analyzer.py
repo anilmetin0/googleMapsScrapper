@@ -314,7 +314,7 @@ def run(input_path: str, output_path: str, model: str, dry_run: bool = False):
 
 _job:            dict = {"status": "idle", "detail": ""}
 _lock                 = threading.Lock()
-_worker_stats:   dict = {"processed": 0, "failed": 0, "running": False}
+_worker_stats:   dict = {"processed": 0, "failed": 0, "skipped": 0, "running": False}
 
 
 def _append_to_output(result: dict, output_path: str):
@@ -372,7 +372,7 @@ def _worker_loop(model: str, output_path: str):
 
         if not reviews:
             log.warning(f"[worker] '{place_name}' için yorum yok, atlanıyor.")
-            _worker_stats["failed"] += 1
+            _worker_stats["skipped"] += 1
             continue
 
         try:

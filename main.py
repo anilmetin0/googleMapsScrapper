@@ -205,6 +205,7 @@ def _accept_consent(page: Page):
 
 def _renew_tor_circuit():
     tor_host = os.getenv("TOR_HOST", "localhost")
+    tor_control_password = os.getenv("TOR_CONTROL_PASSWORD", "")
     try:
         with urllib.request.urlopen(f"http://{tor_host}:8118", timeout=3):
             pass
@@ -212,9 +213,16 @@ def _renew_tor_circuit():
         pass
     try:
         import socket
-        s = socket.create_connection((tor_host, 9051), timeout=5)
-        s.sendall(b"AUTHENTICATE\r\nSIGNAL NEWNYM\r\n")
-        s.close()
+        auth = (
+            f'AUTHENTICATE "{tor_control_password}"\r\n'
+            if tor_control_password
+            else "AUTHENTICATE\r\n"
+        )
+        with socket.create_connection((tor_host, 9051), timeout=5) as s:
+            s.sendall((auth + "SIGNAL NEWNYM\r\nQUIT\r\n").encode("utf-8"))
+            response = s.recv(4096).decode(errors="replace")
+        if "250 OK" not in response:
+            raise RuntimeError(response.strip() or "empty Tor control response")
         log.info("[tor] Yeni devre istendi.")
         time.sleep(5)
     except Exception as e:
