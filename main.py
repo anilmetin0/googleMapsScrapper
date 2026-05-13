@@ -34,6 +34,14 @@ SCRAPED_URLS_KEY  = "scraped:urls"
 SCRAPED_CELLS_KEY = "scraped:cells"
 PENDING_URLS_KEY  = "pending:urls"
 SCRAPE_PHASE_KEY  = "scrape:phase"
+SCRAPER_DRAIN_QUEUES = [
+    item.strip()
+    for item in os.getenv(
+        "SCRAPER_DRAIN_QUEUES",
+        "pending:urls,queue:places:analyzer,queue:places:indexer,queue:places:to_db",
+    ).split(",")
+    if item.strip()
+]
 
 ANKARA_BOUNDS = {
     "lat_min": 39.75, "lat_max": 40.05,
@@ -554,12 +562,7 @@ def _wait_for_queues_to_drain(timeout_s: int = 1800) -> bool:
     r        = get_redis()
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        pending = (
-            r.llen(PENDING_URLS_KEY) +
-            r.llen("queue:places:analyzer") +
-            r.llen("queue:places:indexer") +
-            r.llen("queue:places:to_db")
-        )
+        pending = sum(r.llen(queue_name) for queue_name in SCRAPER_DRAIN_QUEUES)
         if pending == 0:
             return True
         time.sleep(5)

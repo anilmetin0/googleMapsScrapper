@@ -25,6 +25,7 @@ REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://app:changeme@db:5432/neredenevar")
 DB_QUEUE     = "queue:places:to_db"
 DB_WRITER_ARCHIVE_ROOT = os.getenv("DB_WRITER_ARCHIVE_ROOT", "/data/db-writes")
+DB_SCHEMA = (os.getenv("HAIKU_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "public").strip() or "public"
 
 # ---------------------------------------------------------------------------
 # Connection pool (min=1, max=5 — worker is single-threaded, pool for health checks)
@@ -33,10 +34,20 @@ DB_WRITER_ARCHIVE_ROOT = os.getenv("DB_WRITER_ARCHIVE_ROOT", "/data/db-writes")
 _pool: psycopg2.pool.ThreadedConnectionPool = None
 
 
+def _quote_ident(identifier: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier):
+        raise RuntimeError(f"Invalid Postgres schema identifier: {identifier!r}")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _set_search_path(cur):
+    cur.execute(f"SET search_path TO {_quote_ident(DB_SCHEMA)}, public")
+
+
 def _init_pool():
     global _pool
     _pool = psycopg2.pool.ThreadedConnectionPool(1, 5, DATABASE_URL)
-    log.info("DB connection pool oluşturuldu.")
+    log.info("DB connection pool oluşturuldu. schema=%s", DB_SCHEMA)
 
 
 def get_conn():
@@ -56,6 +67,8 @@ def _migrate():
     try:
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_quote_ident(DB_SCHEMA)}")
+            _set_search_path(cur)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS places (
                     id            SERIAL PRIMARY KEY,
@@ -148,6 +161,7 @@ def write_to_db(payload: dict):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            _set_search_path(cur)
             if lat is not None and lng is not None:
                 cur.execute("""
                     INSERT INTO places
@@ -355,7 +369,7 @@ app = FastAPI(title="DB Writer", lifespan=lifespan)
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "schema": DB_SCHEMA}
 
 
 @app.get("/worker/status")

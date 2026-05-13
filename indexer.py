@@ -42,6 +42,7 @@ HASH_EMBED_DIM_SECONDARY = int(os.getenv("HASH_EMBED_DIM_SECONDARY", str(HASH_EM
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
 INDEXER_INPUT   = os.getenv("INDEXER_INPUT", "scraped_data.json")
 INDEXER_ARCHIVE_ROOT = os.getenv("INDEXER_ARCHIVE_ROOT", "/data/index")
+INDEXER_ENABLE_SECONDARY_WORKER = os.getenv("INDEXER_ENABLE_SECONDARY_WORKER", "true").lower() in {"1", "true", "yes", "on"}
 QUEUE_NAME      = "queue:places:indexer"
 
 if torch.cuda.is_available():
@@ -306,6 +307,16 @@ def _worker_loop():
             indexed_targets = []
             total_added = 0
             for target in targets:
+                if target["name"] == "secondary" and not INDEXER_ENABLE_SECONDARY_WORKER:
+                    indexed_targets.append({
+                        "target": target["name"],
+                        "collection": target["collection_name"],
+                        "model": target["model_name"],
+                        "added": 0,
+                        "count": target["collection"].count(),
+                        "skipped": "secondary_deferred",
+                    })
+                    continue
                 added = index_place(
                     target["collection"],
                     get_model(target["model_name"]),
