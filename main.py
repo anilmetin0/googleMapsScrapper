@@ -215,7 +215,7 @@ def _goto(page: Page, url: str, retries: int = 3):
 # Faz 1: URL toplama
 # ---------------------------------------------------------------------------
 
-def _collect_urls_from_feed(page: Page, seen_urls: set) -> list:
+def _collect_urls_from_feed(page: Page, seen_urls: set, limit: Optional[int] = None) -> list:
     feed_selector  = 'div[role="feed"]'
     place_selector = 'a[href*="/maps/place/"]'
     collected      = []
@@ -235,10 +235,16 @@ def _collect_urls_from_feed(page: Page, seen_urls: set) -> list:
         places  = page.locator(f'{scope}{place_selector}').all()
         current_total = len(places)
         for place in places:
-            url = place.get_attribute("href")
+            try:
+                url = place.get_attribute("href", timeout=1000)
+            except Exception:
+                continue
             if not url or url in seen_urls or url in collected:
                 continue
             collected.append(url)
+            if limit and len(collected) >= limit:
+                log.info(f"URL toplama limiti — {len(collected)} yeni URL")
+                return collected
 
         end_of_list = page.locator(
             'span:has-text("Bu listenin sonuna geldiniz"), '
@@ -591,7 +597,8 @@ def _scrape_city_grid(
                 _goto(page, URL.GOOGLE_MAPS_BASE_URL.format_url(
                     latitude=lat, longitude=lon, keyword=keyword
                 ))
-                new_urls = _collect_urls_from_feed(page, already_seen)
+                remaining = max(0, place_limit - found_for_run) if place_limit else None
+                new_urls = _collect_urls_from_feed(page, already_seen, remaining)
 
             if new_urls:
                 if place_limit:
