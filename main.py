@@ -50,6 +50,7 @@ class CityScrapRequest(BaseModel):
     keyword:      str            = "kafe"
     divisions:    int            = Field(default=4, ge=1, le=20)
     max_reviews:  Optional[int]  = Field(default=None, ge=1)
+    place_limit:  Optional[int]  = Field(default=None, ge=1)
     resume:       bool           = True
     bounds:       Optional[dict] = None
     callback_url: Optional[str]  = None
@@ -72,7 +73,7 @@ def scrape_city_cafes(background_tasks: BackgroundTasks, req: CityScrapRequest):
     bounds = req.bounds or ANKARA_BOUNDS
     grid   = _build_grid_divisions(bounds, req.divisions)
     background_tasks.add_task(
-        _scrape_city_grid, grid, req.keyword, req.resume, req.max_reviews, req.callback_url
+        _scrape_city_grid, grid, req.keyword, req.resume, req.max_reviews, req.place_limit, req.callback_url
     )
     return {
         "status":       "started",
@@ -555,6 +556,7 @@ def _scrape_city_grid(
     keyword:      str,
     resume:       bool,
     max_reviews:  Optional[int] = None,
+    place_limit:  Optional[int] = None,
     callback_url: Optional[str] = None,
 ):
     r = get_redis()
@@ -570,8 +572,13 @@ def _scrape_city_grid(
         set(r.smembers(SCRAPED_URLS_KEY)) |
         set(r.lrange(PENDING_URLS_KEY, 0, -1))
     )
+    found_for_run = 0
 
     for idx, cell in enumerate(grid, 1):
+        if place_limit and found_for_run >= place_limit:
+            log.info(f"[Faz 1] place_limit={place_limit} sınırına ulaşıldı.")
+            break
+
         lat, lon, cell_key = cell["lat"], cell["lon"], cell["key"]
         if r.sismember(SCRAPED_CELLS_KEY, cell_key):
             log.info(f"[Faz 1] Hücre {idx}/{total_cells} atlandı → ({lat}, {lon})")
@@ -587,12 +594,17 @@ def _scrape_city_grid(
                 new_urls = _collect_urls_from_feed(page, already_seen)
 
             if new_urls:
+                if place_limit:
+                    remaining = max(0, place_limit - found_for_run)
+                    new_urls = new_urls[:remaining]
+
                 items = [
                     json.dumps({"url": u, "max_reviews": max_reviews}, ensure_ascii=False)
                     for u in new_urls
                 ]
                 r.rpush(PENDING_URLS_KEY, *items)
                 already_seen.update(new_urls)
+                found_for_run += len(new_urls)
                 log.info(
                     f"[Faz 1] +{len(new_urls)} URL | "
                     f"Toplam bekleyen: {r.llen(PENDING_URLS_KEY)}"
