@@ -126,6 +126,65 @@ Kurallar:
 - kalabalik_seviyesi: yorumlardaki kalabalık/kuyruk/sessiz/sakin ifadelerine göre kategorize et"""
 
 
+def fallback_analysis(place_name: str, reviews: list, reason: str) -> dict:
+    text = " ".join(str(review) for review in reviews).lower()
+    joined_sample = " ".join(str(review).strip() for review in reviews[:3] if str(review).strip())
+
+    positives = []
+    if any(word in text for word in ["güzel", "harika", "iyi", "mükemmel", "sevdim"]):
+        positives.append("Yorumlarda olumlu genel deneyim vurgusu var.")
+    if any(word in text for word in ["lezzet", "kahve", "tatlı", "yemek", "çay"]):
+        positives.append("Ürün ve lezzet tarafı yorumlarda öne çıkıyor.")
+    if any(word in text for word in ["temiz", "ferah", "atmosfer", "ortam"]):
+        positives.append("Ortam/atmosfer hakkında yorum sinyali var.")
+    if not positives:
+        positives.append("Sınırlı yorum üzerinden temel kullanıcı deneyimi çıkarıldı.")
+
+    negatives = []
+    if any(word in text for word in ["pahalı", "fiyat", "ücret"]):
+        negatives.append("Fiyat algısı yorumlarda takip edilmeli.")
+    if any(word in text for word in ["kalabalık", "sıra", "bekle"]):
+        negatives.append("Yoğunluk veya bekleme süresi sinyali var.")
+    if any(word in text for word in ["kötü", "yavaş", "soğuk", "kirli"]):
+        negatives.append("Olumsuz deneyim belirten yorumlar var.")
+
+    products = [
+        product
+        for product in ["kahve", "çay", "tatlı", "pasta", "simit", "yemek"]
+        if product in text
+    ]
+
+    score = min(_max_score_for_review_count(len(reviews)), 7.0)
+    if negatives:
+        score = max(5.5, score - 0.5)
+
+    return {
+        "place_name": place_name,
+        "scores": {
+            "atmosfer": score,
+            "urun_kalitesi": score,
+            "yiyecek_kalitesi": score,
+            "hizmet": score,
+            "sessizlik_calisma_uygunlugu": 6.0,
+            "fiyat_performans": 6.0 if negatives else score,
+        },
+        "genel_puan": score,
+        "ozet": (
+            f"{place_name} için LLM analizi kullanılamadığı için yorumlara dayalı "
+            f"deterministik özet üretildi. {joined_sample[:240]}"
+        ).strip(),
+        "one_cikanlar": positives[:5],
+        "eksiler": negatives,
+        "populer_urunler": products,
+        "etiketler": ["llm-fallback", "google-yorumlari"],
+        "kim_icin_ideal": "Kısa yorum sinyallerine göre hızlı mekan keşfi yapmak isteyen kullanıcılar için.",
+        "fiyat_seviyesi": "belirtilmemiş",
+        "wifi_priz": "var" if any(word in text for word in ["wifi", "wi-fi", "priz", "şarj"]) else "belirtilmemiş",
+        "kalabalik_seviyesi": "kalabalık" if any(word in text for word in ["kalabalık", "sıra", "kuyruk"]) else "belirtilmemiş",
+        "fallback_reason": reason,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Core analyzer
 # ---------------------------------------------------------------------------
@@ -180,7 +239,9 @@ def analyze_single(
         if attempt < MAX_RETRIES:
             log.info("Tekrar deneniyor...")
 
-    raise RuntimeError(f"'{place_name}' için {MAX_RETRIES} denemede de analiz başarısız.")
+    reason = f"llm_failed_after_{MAX_RETRIES}_attempts"
+    log.warning(f"'{place_name}' için LLM analizi başarısız; fallback analiz kullanılacak.")
+    return fallback_analysis(place_name, reviews, reason)
 
 
 # ---------------------------------------------------------------------------

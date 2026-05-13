@@ -117,6 +117,17 @@ def build_user_message(place_name: str, question: str, reviews: list) -> str:
     return f"Mekan: {place_name}\nSoru: {question}\n\nYorumlar:\n{reviews_text}"
 
 
+def fallback_answer(place_name: str, question: str, reviews: list) -> str:
+    snippets = [str(review).strip() for review in reviews[:3] if str(review).strip()]
+    if not snippets:
+        return "Bu konuda yorumlarda bilgi bulunamadı."
+    joined = " ".join(snippets)
+    return (
+        f"{place_name} için bulunan yorum kaynaklarına göre: {joined[:420]} "
+        f"Soru: {question}"
+    ).strip()
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -183,18 +194,22 @@ def ask(req: AskRequest):
             detail=f"'{req.place_name}' için yorum bulunamadı.",
         )
 
-    response = llm_client.messages.create(
-        model=LLM_MODEL,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": build_user_message(req.place_name, req.question, reviews)}],
-        max_tokens=512,
-        temperature=0.1,
-    )
-    raw = response.content[0].text or ""
-    if "</think>" in raw:
-        answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-    else:
-        answer = re.sub(r"<think>.*", "", raw, flags=re.DOTALL).strip()
+    try:
+        response = llm_client.messages.create(
+            model=LLM_MODEL,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": build_user_message(req.place_name, req.question, reviews)}],
+            max_tokens=512,
+            temperature=0.1,
+        )
+        raw = response.content[0].text or ""
+        if "</think>" in raw:
+            answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        else:
+            answer = re.sub(r"<think>.*", "", raw, flags=re.DOTALL).strip()
+    except Exception as e:
+        log.warning(f"[/ask] LLM çağrısı başarısız, fallback yanıt kullanılacak: {e}")
+        answer = fallback_answer(req.place_name, req.question, reviews)
 
     log.info(f"[/ask] '{req.place_name}' | '{req.question}' | {len(reviews)} kaynak")
     return AskResponse(
