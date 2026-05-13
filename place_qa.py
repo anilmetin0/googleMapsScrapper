@@ -27,11 +27,11 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 LLM_MODEL       = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")
-EMBED_MODEL     = "intfloat/multilingual-e5-large"
+EMBED_MODEL     = os.getenv("EMBED_MODEL", "intfloat/multilingual-e5-base")
 CHROMA_PATH     = os.getenv("CHROMA_PATH", "./chroma_db")
 CHROMA_HOST     = os.getenv("CHROMA_HOST", "")
 CHROMA_PORT     = int(os.getenv("CHROMA_PORT", "8000"))
-COLLECTION_NAME = "place_reviews"
+COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "place_reviews_v2")
 DEFAULT_TOP_K   = 6
 
 SYSTEM_PROMPT = (
@@ -85,11 +85,17 @@ class AskRequest(BaseModel):
     top_k:      int = Field(default=DEFAULT_TOP_K, ge=1, le=20)
 
 
+class AskSource(BaseModel):
+    snippet_text: str
+    score:        Optional[float] = None
+
+
 class AskResponse(BaseModel):
     place_name:   str
     question:     str
     answer:       str
     sources_used: int
+    sources:      list[AskSource] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -148,11 +154,16 @@ def ask(req: AskRequest):
                 query_embeddings=[question_embedding],
                 n_results=safe_n,
                 where={"place_name": req.place_name},
+                include=["documents", "distances"],
             )
             reviews = results["documents"][0] if results["documents"] else []
+            distances = results.get("distances", [[]])[0] if results.get("distances") else []
         except Exception as e:
             log.warning(f"[/ask] ChromaDB query hatası, fallback'e geçildi: {e}")
             reviews = all_docs[:n]
+            distances = []
+    else:
+        distances = []
 
     if not reviews:
         raise HTTPException(
@@ -179,4 +190,15 @@ def ask(req: AskRequest):
         question=req.question,
         answer=answer,
         sources_used=len(reviews),
+        sources=[
+            AskSource(
+                snippet_text=review,
+                score=(
+                    float(1 - distances[index])
+                    if index < len(distances) and distances[index] is not None
+                    else None
+                ),
+            )
+            for index, review in enumerate(reviews)
+        ],
     )

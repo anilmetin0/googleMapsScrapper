@@ -27,11 +27,11 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-EMBED_MODEL     = "intfloat/multilingual-e5-large"
+EMBED_MODEL     = os.getenv("EMBED_MODEL", "intfloat/multilingual-e5-base")
 CHROMA_PATH     = os.getenv("CHROMA_PATH", "./chroma_db")
 CHROMA_HOST     = os.getenv("CHROMA_HOST", "")
 CHROMA_PORT     = int(os.getenv("CHROMA_PORT", "8000"))
-COLLECTION_NAME = "place_reviews"
+COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "place_reviews_v2")
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
 INDEXER_INPUT   = os.getenv("INDEXER_INPUT", "scraped_data.json")
 QUEUE_NAME      = "queue:places:indexer"
@@ -234,7 +234,29 @@ fa_app = FastAPI(title="Indexer Mikroservisi", lifespan=lifespan)
 
 @fa_app.get("/health")
 def health():
-    return {"status": "ok"}
+    count = None
+    try:
+        chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT) if CHROMA_HOST else chromadb.PersistentClient(path=CHROMA_PATH)
+        collection = chroma_client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
+        )
+        count = collection.count()
+    except Exception as e:
+        return {
+            "status": "degraded",
+            "detail": str(e),
+            "collection": COLLECTION_NAME,
+            "model": EMBED_MODEL,
+        }
+
+    return {
+        "status": "ok",
+        "collection": COLLECTION_NAME,
+        "model": EMBED_MODEL,
+        "total_indexed_reviews": count,
+        "worker": _worker_stats,
+    }
 
 
 @fa_app.post("/run")
