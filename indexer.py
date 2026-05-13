@@ -7,6 +7,7 @@ import hashlib
 import math
 import re
 import threading
+from datetime import datetime, UTC
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -30,13 +31,17 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 EMBED_MODEL     = os.getenv("EMBED_MODEL", "intfloat/multilingual-e5-base")
+EMBED_MODEL_SECONDARY = os.getenv("EMBED_MODEL_SECONDARY", "").strip()
 CHROMA_PATH     = os.getenv("CHROMA_PATH", "./chroma_db")
 CHROMA_HOST     = os.getenv("CHROMA_HOST", "")
 CHROMA_PORT     = int(os.getenv("CHROMA_PORT", "8000"))
 COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "place_reviews_v2")
+COLLECTION_NAME_SECONDARY = os.getenv("CHROMA_COLLECTION_SECONDARY", "").strip()
 HASH_EMBED_DIM  = int(os.getenv("HASH_EMBED_DIM", "384"))
+HASH_EMBED_DIM_SECONDARY = int(os.getenv("HASH_EMBED_DIM_SECONDARY", str(HASH_EMBED_DIM)))
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
 INDEXER_INPUT   = os.getenv("INDEXER_INPUT", "scraped_data.json")
+INDEXER_ARCHIVE_ROOT = os.getenv("INDEXER_ARCHIVE_ROOT", "/data/index")
 QUEUE_NAME      = "queue:places:indexer"
 
 if torch.cuda.is_available():
@@ -71,19 +76,19 @@ def review_doc_id(place_name: str, idx: int) -> str:
     return f"{place_slug(place_name)}_{idx}"
 
 
-def use_hash_embeddings() -> bool:
-    return EMBED_MODEL.lower() in {"hash", "hashing", "local-hashing"}
+def use_hash_embeddings(model_name: str = EMBED_MODEL) -> bool:
+    return model_name.lower() in {"hash", "hashing", "local-hashing"}
 
 
-def hash_embedding(text: str) -> list[float]:
-    vector = [0.0] * HASH_EMBED_DIM
+def hash_embedding(text: str, dim: int = HASH_EMBED_DIM) -> list[float]:
+    vector = [0.0] * dim
     tokens = re.findall(r"\w+", text.lower(), flags=re.UNICODE)
     if not tokens:
         tokens = [text.lower()]
 
     for token in tokens:
         digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-        index = int.from_bytes(digest[:4], "little") % HASH_EMBED_DIM
+        index = int.from_bytes(digest[:4], "little") % dim
         sign = 1.0 if digest[4] & 1 else -1.0
         vector[index] += sign
 
@@ -91,9 +96,14 @@ def hash_embedding(text: str) -> list[float]:
     return [value / norm for value in vector]
 
 
-def encode_texts(model: Optional[SentenceTransformer], texts: list[str]) -> list[list[float]]:
-    if use_hash_embeddings():
-        return [hash_embedding(text) for text in texts]
+def encode_texts(
+    model: Optional[SentenceTransformer],
+    texts: list[str],
+    model_name: str = EMBED_MODEL,
+    hash_dim: int = HASH_EMBED_DIM,
+) -> list[list[float]]:
+    if use_hash_embeddings(model_name):
+        return [hash_embedding(text, hash_dim) for text in texts]
 
     if model is None:
         raise RuntimeError("SentenceTransformer model is not loaded")
@@ -116,6 +126,8 @@ def index_place(
     place_name: str,
     source_url: str,
     reviews:    list,
+    model_name:  str = EMBED_MODEL,
+    hash_dim:    int = HASH_EMBED_DIM,
     upsert:     bool = False,
 ) -> int:
     existing = collection.get(where={"place_name": place_name}, limit=1)
@@ -129,7 +141,7 @@ def index_place(
         log.info(f"Güncelleniyor — {len(all_existing['ids'])} eski yorum silindi.")
 
     prefixed   = [f"passage: {r}" for r in reviews]
-    embeddings = encode_texts(model, prefixed)
+    embeddings = encode_texts(model, prefixed, model_name=model_name, hash_dim=hash_dim)
 
     collection.add(
         ids=[review_doc_id(place_name, i) for i in range(len(reviews))],
@@ -152,7 +164,7 @@ def run(input_path: str, reset: bool = False):
 
     log.info(f"Device: {DEVICE} | Batch size: {BATCH_SIZE}")
     log.info(f"Model yükleniyor: {EMBED_MODEL}")
-    model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
+    model = None if use_hash_embeddings() else SentenceTransformer(EMBED_MODEL, device=DEVICE)
 
     with open(input_file, encoding="utf-8") as f:
         scraped_data = json.load(f)
@@ -185,7 +197,7 @@ def run(input_path: str, reset: bool = False):
             skipped += 1
             continue
 
-        added = index_place(collection, model, place_name, source_url, reviews)
+        added = index_place(collection, model, place_name, source_url, reviews, model_name=EMBED_MODEL, hash_dim=HASH_EMBED_DIM)
         if added:
             indexed += 1
             log.info(f"  ✓ {added} yorum eklendi.")
@@ -205,31 +217,67 @@ def run(input_path: str, reset: bool = False):
 _job:          dict = {"status": "idle", "detail": ""}
 _lock               = threading.Lock()
 _worker_stats: dict = {"processed": 0, "failed": 0, "running": False}
-_model: Optional[SentenceTransformer] = None
+_models: dict[str, SentenceTransformer] = {}
 _model_lock = threading.Lock()
 
 
-def get_model() -> Optional[SentenceTransformer]:
-    global _model
-    if use_hash_embeddings():
+def get_model(model_name: str) -> Optional[SentenceTransformer]:
+    if use_hash_embeddings(model_name):
         return None
 
-    if _model is None:
+    if model_name not in _models:
         with _model_lock:
-            if _model is None:
-                log.info(f"Model lazy yükleniyor: {EMBED_MODEL} ({DEVICE})")
-                _model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
-    return _model
+            if model_name not in _models:
+                log.info(f"Model lazy yükleniyor: {model_name} ({DEVICE})")
+                _models[model_name] = SentenceTransformer(model_name, device=DEVICE)
+    return _models[model_name]
+
+
+def embedding_targets(chroma_client):
+    targets = [
+        {
+            "name": "primary",
+            "collection_name": COLLECTION_NAME,
+            "model_name": EMBED_MODEL,
+            "hash_dim": HASH_EMBED_DIM,
+        }
+    ]
+    if COLLECTION_NAME_SECONDARY and EMBED_MODEL_SECONDARY:
+        targets.append(
+            {
+                "name": "secondary",
+                "collection_name": COLLECTION_NAME_SECONDARY,
+                "model_name": EMBED_MODEL_SECONDARY,
+                "hash_dim": HASH_EMBED_DIM_SECONDARY,
+            }
+        )
+
+    for target in targets:
+        target["collection"] = chroma_client.get_or_create_collection(
+            name=target["collection_name"],
+            metadata={"hnsw:space": "cosine"},
+        )
+    return targets
+
+
+def archive_index_result(run_id: Optional[str], payload: dict):
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(run_id or "unknown")).strip("-") or "unknown"
+    root = Path(INDEXER_ARCHIVE_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    record = {
+        "run_id": safe_run_id,
+        "archived_at": datetime.now(UTC).isoformat(),
+        **payload,
+    }
+    with (root / f"{safe_run_id}.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _worker_loop():
     log.info(f"[worker] Indexer Redis worker başladı — kuyruk: {QUEUE_NAME}")
     r             = redis.from_url(REDIS_URL, decode_responses=True)
     chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT) if CHROMA_HOST else chromadb.PersistentClient(path=CHROMA_PATH)
-    collection    = chroma_client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
-    )
+    targets       = embedding_targets(chroma_client)
 
     while _worker_stats["running"]:
         item = r.brpop(QUEUE_NAME, timeout=5)
@@ -246,6 +294,7 @@ def _worker_loop():
         place_name = entry.get("name") or extract_place_name(entry)
         reviews    = entry.get("reviews", [])
         source_url = entry.get("url", "")
+        run_id     = entry.get("run_id")
 
         log.info(f"[worker] İndeksleniyor: '{place_name}' — {len(reviews)} yorum")
 
@@ -254,10 +303,40 @@ def _worker_loop():
             continue
 
         try:
-            added = index_place(collection, get_model(), place_name, source_url, reviews, upsert=True)
-            if added:
+            indexed_targets = []
+            total_added = 0
+            for target in targets:
+                added = index_place(
+                    target["collection"],
+                    get_model(target["model_name"]),
+                    place_name,
+                    source_url,
+                    reviews,
+                    model_name=target["model_name"],
+                    hash_dim=target["hash_dim"],
+                    upsert=True,
+                )
+                total_added += added
+                indexed_targets.append({
+                    "target": target["name"],
+                    "collection": target["collection_name"],
+                    "model": target["model_name"],
+                    "added": added,
+                    "count": target["collection"].count(),
+                })
+            try:
+                archive_index_result(run_id, {
+                    "place_name": place_name,
+                    "source_url": source_url,
+                    "raw_archive_path": entry.get("raw_archive_path"),
+                    "review_count": len(reviews),
+                    "targets": indexed_targets,
+                })
+            except Exception as archive_error:
+                log.warning(f"Indexer arşivi yazılamadı: {archive_error}")
+            if total_added:
                 _worker_stats["processed"] += 1
-                log.info(f"[worker] ✓ '{place_name}' — {added} yorum eklendi/güncellendi.")
+                log.info(f"[worker] ✓ '{place_name}' — {total_added} indeks kaydı eklendi/güncellendi.")
             else:
                 log.info(f"[worker] '{place_name}' zaten indexli, atlandı.")
         except Exception as e:
@@ -281,14 +360,17 @@ fa_app = FastAPI(title="Indexer Mikroservisi", lifespan=lifespan)
 
 @fa_app.get("/health")
 def health():
-    count = None
+    target_payload = []
     try:
         chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT) if CHROMA_HOST else chromadb.PersistentClient(path=CHROMA_PATH)
-        collection = chroma_client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-        )
-        count = collection.count()
+        for target in embedding_targets(chroma_client):
+            target_payload.append({
+                "target": target["name"],
+                "collection": target["collection_name"],
+                "model": target["model_name"],
+                "hash_embed_dim": target["hash_dim"] if use_hash_embeddings(target["model_name"]) else None,
+                "total_indexed_reviews": target["collection"].count(),
+            })
     except Exception as e:
         return {
             "status": "degraded",
@@ -301,9 +383,10 @@ def health():
         "status": "ok",
         "collection": COLLECTION_NAME,
         "model": EMBED_MODEL,
-        "model_loaded": use_hash_embeddings() or _model is not None,
+        "model_loaded": use_hash_embeddings() or EMBED_MODEL in _models,
         "hash_embed_dim": HASH_EMBED_DIM if use_hash_embeddings() else None,
-        "total_indexed_reviews": count,
+        "total_indexed_reviews": target_payload[0]["total_indexed_reviews"] if target_payload else 0,
+        "targets": target_payload,
         "worker": _worker_stats,
     }
 

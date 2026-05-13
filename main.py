@@ -6,6 +6,8 @@ import sys
 import time
 import urllib.request
 from contextlib import asynccontextmanager
+from datetime import datetime, UTC
+from pathlib import Path
 from typing import Optional
 
 import redis
@@ -25,6 +27,7 @@ log = logging.getLogger(__name__)
 
 REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379")
 SCRAPER_OUTPUT    = os.getenv("SCRAPER_OUTPUT", "scraped_data.json")
+RAW_ARCHIVE_ROOT  = os.getenv("RAW_ARCHIVE_ROOT", "/data/raw")
 ANALYZER_QUEUE    = "queue:places:analyzer"
 INDEXER_QUEUE     = "queue:places:indexer"
 SCRAPED_URLS_KEY  = "scraped:urls"
@@ -51,6 +54,7 @@ class CityScrapRequest(BaseModel):
     divisions:    int            = Field(default=4, ge=1, le=20)
     max_reviews:  Optional[int]  = Field(default=None, ge=1)
     place_limit:  Optional[int]  = Field(default=None, ge=1)
+    run_id:       Optional[str]  = None
     resume:       bool           = True
     bounds:       Optional[dict] = None
     callback_url: Optional[str]  = None
@@ -72,13 +76,24 @@ app = FastAPI(title="Scraper Mikroservisi", lifespan=lifespan)
 def scrape_city_cafes(background_tasks: BackgroundTasks, req: CityScrapRequest):
     bounds = req.bounds or ANKARA_BOUNDS
     grid   = _build_grid_divisions(bounds, req.divisions)
+    run_id = _safe_run_id(req.run_id)
+    _write_run_manifest(run_id, {
+        "run_id": run_id,
+        "keyword": req.keyword,
+        "bounds": bounds,
+        "divisions": req.divisions,
+        "max_reviews": req.max_reviews,
+        "place_limit": req.place_limit,
+        "started_at": datetime.now(UTC).isoformat(),
+    })
     background_tasks.add_task(
-        _scrape_city_grid, grid, req.keyword, req.resume, req.max_reviews, req.place_limit, req.callback_url
+        _scrape_city_grid, grid, req.keyword, req.resume, req.max_reviews, req.place_limit, req.callback_url, run_id
     )
     return {
         "status":       "started",
         "grid_cells":   len(grid),
         "divisions":    f"{req.divisions}x{req.divisions}",
+        "run_id":       run_id,
         "resume":       req.resume,
         "callback_url": req.callback_url,
     }
@@ -557,6 +572,48 @@ def _save_json(data: list, filename: str):
     log.info(f"Dosyaya kaydedildi: {len(data)} mekan")
 
 
+def _safe_run_id(run_id: Optional[str]) -> str:
+    raw = run_id or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-")
+    return safe or "run"
+
+
+def _safe_place_filename(place_data: dict) -> str:
+    source = place_data.get("url") or place_data.get("name") or "place"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", source)[-140:].strip("-")
+    return f"{safe or 'place'}.json"
+
+
+def _archive_dir(run_id: str, *parts: str) -> Path:
+    path = Path(RAW_ARCHIVE_ROOT) / _safe_run_id(run_id)
+    for part in parts:
+        path = path / part
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _write_run_manifest(run_id: str, payload: dict):
+    run_dir = _archive_dir(run_id)
+    manifest = run_dir / "manifest.json"
+    manifest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def archive_place(run_id: Optional[str], place_data: dict) -> str:
+    safe_run_id = _safe_run_id(run_id)
+    places_dir = _archive_dir(safe_run_id, "places")
+    path = places_dir / _safe_place_filename(place_data)
+    payload = {
+        "run_id": safe_run_id,
+        "archived_at": datetime.now(UTC).isoformat(),
+        "place": place_data,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    jsonl = _archive_dir(safe_run_id) / "places.jsonl"
+    with jsonl.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    return str(path)
+
+
 def _scrape_city_grid(
     grid:         list,
     keyword:      str,
@@ -564,6 +621,7 @@ def _scrape_city_grid(
     max_reviews:  Optional[int] = None,
     place_limit:  Optional[int] = None,
     callback_url: Optional[str] = None,
+    run_id:       Optional[str] = None,
 ):
     r = get_redis()
 
@@ -574,10 +632,13 @@ def _scrape_city_grid(
     if not resume:
         r.delete(PENDING_URLS_KEY, SCRAPED_CELLS_KEY, SCRAPED_URLS_KEY)
 
-    already_seen: set = (
-        set(r.smembers(SCRAPED_URLS_KEY)) |
-        set(r.lrange(PENDING_URLS_KEY, 0, -1))
-    )
+    pending_urls = set()
+    for raw_pending in r.lrange(PENDING_URLS_KEY, 0, -1):
+        try:
+            pending_urls.add(json.loads(raw_pending).get("url", raw_pending))
+        except Exception:
+            pending_urls.add(raw_pending)
+    already_seen: set = set(r.smembers(SCRAPED_URLS_KEY)) | pending_urls
     found_for_run = 0
 
     for idx, cell in enumerate(grid, 1):
@@ -606,7 +667,7 @@ def _scrape_city_grid(
                     new_urls = new_urls[:remaining]
 
                 items = [
-                    json.dumps({"url": u, "max_reviews": max_reviews}, ensure_ascii=False)
+                    json.dumps({"url": u, "max_reviews": max_reviews, "run_id": run_id}, ensure_ascii=False)
                     for u in new_urls
                 ]
                 r.rpush(PENDING_URLS_KEY, *items)
@@ -635,6 +696,14 @@ def _scrape_city_grid(
     scraped = r.scard(SCRAPED_URLS_KEY)
     r.set(SCRAPE_PHASE_KEY, "tamamlandi")
     log.info(f"[Tamamlandı] {scraped} mekan | Kuyruklar boşaldı: {drained}")
+    if run_id:
+        _write_run_manifest(run_id, {
+            "run_id": _safe_run_id(run_id),
+            "keyword": keyword,
+            "completed_at": datetime.now(UTC).isoformat(),
+            "places_scraped": scraped,
+            "queues_drained": drained,
+        })
 
     if callback_url:
         _fire_callback(callback_url, {

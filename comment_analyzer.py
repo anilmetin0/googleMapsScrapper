@@ -36,6 +36,7 @@ MAX_REVIEWS    = 200
 
 ANALYZER_INPUT  = os.getenv("ANALYZER_INPUT",  "scraped_data.json")
 ANALYZER_OUTPUT = os.getenv("ANALYZER_OUTPUT", "analyzed_data.json")
+ANALYZER_ARCHIVE_ROOT = os.getenv("ANALYZER_ARCHIVE_ROOT", "/data/analyzed")
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
 QUEUE_NAME      = "queue:places:analyzer"
 DB_QUEUE        = "queue:places:to_db"
@@ -332,6 +333,21 @@ def _append_to_output(result: dict, output_path: str):
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def _archive_analysis(entry: dict, result: dict):
+    run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(entry.get("run_id") or "unknown")).strip("-") or "unknown"
+    root = Path(ANALYZER_ARCHIVE_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "archived_at": datetime.now(UTC).isoformat(),
+        "source_url": entry.get("url", ""),
+        "place_name": result.get("place_name"),
+        "analysis": result,
+    }
+    with (root / f"{run_id}.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
 def _worker_loop(model: str, output_path: str):
     log.info(f"[worker] Redis worker başladı — kuyruk: {QUEUE_NAME}")
     client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -367,6 +383,10 @@ def _worker_loop(model: str, output_path: str):
             result["analyzed_at"]           = datetime.now(UTC).isoformat()
 
             _append_to_output(result, output_path)
+            try:
+                _archive_analysis(entry, result)
+            except Exception as archive_error:
+                log.warning(f"Analiz arşivi yazılamadı: {archive_error}")
             _worker_stats["processed"] += 1
             log.info(f"[worker] ✓ '{place_name}' — genel puan: {result.get('genel_puan', '?')}")
 
@@ -384,6 +404,8 @@ def _worker_loop(model: str, output_path: str):
                     "website_type":  entry.get("website_type"),
                     "images":        entry.get("images", []),
                     "reviews":       entry.get("reviews", []),
+                    "run_id":        entry.get("run_id"),
+                    "raw_archive_path": entry.get("raw_archive_path"),
                 },
                 "analysis": result,
             }, ensure_ascii=False)

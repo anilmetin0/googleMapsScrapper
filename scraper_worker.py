@@ -15,6 +15,7 @@ from playwright.sync_api import sync_playwright
 from main import (
     _launch_page,
     _scrape_place,
+    archive_place,
     get_redis,
     ANALYZER_QUEUE,
     INDEXER_QUEUE,
@@ -52,6 +53,7 @@ def _worker_loop():
                 job = json.loads(raw)
                 url         = job["url"]
                 max_reviews: Optional[int] = job.get("max_reviews")
+                run_id: Optional[str] = job.get("run_id")
             except (json.JSONDecodeError, KeyError):
                 log.error(f"[{WORKER_ID}] Geçersiz iş formatı, atlanıyor: {raw[:100]}")
                 continue
@@ -60,10 +62,13 @@ def _worker_loop():
 
             try:
                 place_data = _scrape_place(page, url, max_reviews)
+                place_data["run_id"] = run_id
+                raw_archive_path = archive_place(run_id, place_data)
+                place_data["raw_archive_path"] = raw_archive_path
 
                 log.info(
                     f"[{WORKER_ID}] ✓ {place_data['name']} | "
-                    f"{place_data['total_reviews_scraped']} yorum"
+                    f"{place_data['total_reviews_scraped']} yorum | {raw_archive_path}"
                 )
 
                 payload = json.dumps(place_data, ensure_ascii=False)

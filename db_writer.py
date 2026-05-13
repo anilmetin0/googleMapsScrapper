@@ -1,9 +1,12 @@
 import json
 import logging
 import os
+import re
 import sys
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, UTC
+from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
@@ -21,6 +24,7 @@ log = logging.getLogger(__name__)
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://app:changeme@db:5432/neredenevar")
 DB_QUEUE     = "queue:places:to_db"
+DB_WRITER_ARCHIVE_ROOT = os.getenv("DB_WRITER_ARCHIVE_ROOT", "/data/db-writes")
 
 # ---------------------------------------------------------------------------
 # Connection pool (min=1, max=5 — worker is single-threaded, pool for health checks)
@@ -270,11 +274,32 @@ def write_to_db(payload: dict):
 
         conn.commit()
         log.info(f"  ✓ DB yazıldı: '{place.get('name')}' (id={place_id})")
+        try:
+            _archive_db_write(place, analysis, place_id)
+        except Exception as archive_error:
+            log.warning(f"DB write arşivi yazılamadı: {archive_error}")
     except Exception:
         conn.rollback()
         raise
     finally:
         release_conn(conn)
+
+
+def _archive_db_write(place: dict, analysis: dict, place_id: int):
+    run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(place.get("run_id") or "unknown")).strip("-") or "unknown"
+    root = Path(DB_WRITER_ARCHIVE_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "archived_at": datetime.now(UTC).isoformat(),
+        "place_id": place_id,
+        "source_url": place.get("url", ""),
+        "place_name": place.get("name"),
+        "raw_archive_path": place.get("raw_archive_path"),
+        "analysis_present": bool(analysis),
+    }
+    with (root / f"{run_id}.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 # ---------------------------------------------------------------------------
